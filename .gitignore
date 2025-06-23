@@ -1,0 +1,5 @@
+  .venv/
+  fert-chatbot-ui/node_modules/
+  *.xlsx
+  *.csv
+  .env

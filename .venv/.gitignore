@@ -1,0 +1,13 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+.env
+
+# Node
+fert-chatbot-ui/node_modules/
+fert-chatbot-ui/.env
+
+# Data files
+*.xlsx
+*.csv
