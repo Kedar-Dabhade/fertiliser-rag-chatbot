@@ -1,0 +1,78 @@
+services:
+  opensearch:
+    image: opensearchproject/opensearch:2.19.1
+    container_name: opensearch
+    environment:
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - "OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g"
+      - "DISABLE_SECURITY_PLUGIN=true"
+      - "OPENSEARCH_INITIAL_ADMIN_PASSWORD=n864pyAkop5E5WB"
+      # SSL disabled for local development
+      # - "plugins.security.ssl.http.enabled=false"
+      # - "plugins.security.ssl.transport.enabled=false"
+      # The following lines are commented out because certs are not used
+      # - "plugins.security.ssl.http.pemcert_filepath=certs/node.pem"
+      # - "plugins.security.ssl.http.pemkey_filepath=certs/node-key.pem"
+      # - "plugins.security.ssl.http.pemtrustedcas_filepath=certs/root-ca.pem"
+      # - "plugins.security.allow_unsafe_democertificates=true"
+      # - "plugins.security.ssl.transport.pemcert_filepath=certs/node.pem"
+      # - "plugins.security.ssl.transport.pemkey_filepath=certs/node-key.pem"
+      # - "plugins.security.ssl.transport.pemtrustedcas_filepath=certs/root-ca.pem"
+      # - "plugins.security.ssl.http.enabled_protocols=TLSv1.2,TLSv1.3"
+      - "knn.plugin.enabled=true"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+      # - ./certs:/usr/share/opensearch/config/certs  # Commented out for no SSL
+    ports:
+      - 9200:9200
+    networks:
+      - opensearch-net
+    healthcheck:
+      test: [ "CMD", "curl", "-u", "admin:n864pyAkop5E5WB", "http://localhost:9200" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:2.19.1
+    container_name: opensearch-dashboards
+    ports:
+      - 5601:5601
+    environment:
+      - 'OPENSEARCH_HOSTS=["http://opensearch:9200"]'
+      - "DISABLE_SECURITY_DASHBOARDS_PLUGIN=false"
+      - "OPENSEARCH_USERNAME=admin"
+      - "OPENSEARCH_PASSWORD=n864pyAkop5E5WB"
+      - "OPENSEARCH_SSL_VERIFICATIONMODE=none"
+    networks:
+      - opensearch-net
+    depends_on:
+      - opensearch
+  flask:
+    build: .
+#    command: flask run --host=0.0.0.0 --port=5555
+    ports:
+      - "5555:5555"
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    environment:
+      - OPENSEARCH_HOST=http://opensearch:9200
+      - OPENSEARCH_USER=admin
+      - OPENSEARCH_PASSWORD=n864pyAkop5E5WB
+      - OPENSEARCH_VERIFY_CERTS=false
+    restart: unless-stopped
+volumes:
+  opensearch-data:
+
+networks:
+  opensearch-net:

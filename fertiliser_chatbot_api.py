@@ -1,17 +1,19 @@
-from flask import Flask, request, jsonify, Response, stream_with_context
+from flask import Flask, request, jsonify, Response, stream_with_context, session
 import os
 from dotenv import load_dotenv
 from pinecone import Pinecone, ServerlessSpec
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_pinecone import PineconeVectorStore
 from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferMemory
+from langchain.memory import ConversationSummaryMemory, FileChatMessageHistory
 from langchain.prompts import PromptTemplate
 from flask_cors import CORS
 from langchain.callbacks.base import BaseCallbackHandler
 import queue
 import threading
 import re
+import tiktoken  # Add this import at the top
+import uuid
 
 # Load environment variables
 load_dotenv()
@@ -36,16 +38,18 @@ embeddings = OpenAIEmbeddings(openai_api_key=openai_api_key)
 vectorstore = PineconeVectorStore(index=index, embedding=embeddings)
 
 # Set up retriever
-retriever = vectorstore.as_retriever(search_kwargs={'k': 7})
+retriever = vectorstore.as_retriever(search_kwargs={'k': 1})
 
 # Set up LLM
 llm = ChatOpenAI(openai_api_key=openai_api_key, model="gpt-4")
 
 # Set up memory for chat history, specify output_key
-memory = ConversationBufferMemory(
+memory = ConversationSummaryMemory(
+    llm=llm,
     memory_key="chat_history",
     return_messages=True,
-    output_key="answer"
+    output_key="answer",
+    max_token_limit=1250  
 )
 
 # Custom prompt for the agent
@@ -105,7 +109,62 @@ class QueueStreamHandler(BaseCallbackHandler):
             yield token
 
 app = Flask(__name__)
-CORS(app)
+app.secret_key = "dev-secret-key-please-change"  # Set a strong, unique key in production
+CORS(app, supports_credentials=True)
+
+@app.before_request
+def ensure_session():
+    if 'session_id' not in session:
+        session['session_id'] = str(uuid.uuid4())
+
+# Directory to store per-session chat histories
+CHAT_HISTORY_DIR = 'sessions'
+os.makedirs(CHAT_HISTORY_DIR, exist_ok=True)
+
+def get_session_history():
+    session_id = session['session_id']
+    history_path = os.path.join(CHAT_HISTORY_DIR, f"{session_id}.json")
+    return FileChatMessageHistory(history_path)
+
+@app.route('/session-chat', methods=['POST'])
+def session_chat():
+    data = request.get_json()
+    user_message = data.get('message', '')
+    if not user_message:
+        return jsonify({"error": "No message provided."}), 400
+    history = get_session_history()
+    # Create a ConversationSummaryMemory for this session
+    session_memory = ConversationSummaryMemory(
+        llm=llm,
+        memory_key="chat_history",
+        return_messages=True,
+        output_key="answer",
+        max_token_limit=1250,
+        chat_memory=history
+    )
+    # Create a ConversationalRetrievalChain for this session
+    session_chain = ConversationalRetrievalChain.from_llm(
+        llm=llm,
+        retriever=retriever,
+        memory=session_memory,
+        combine_docs_chain_kwargs={"prompt": custom_prompt},
+        return_source_documents=True
+    )
+    result = session_chain.invoke({"question": user_message})
+    bot_response = result["answer"]
+    # Store user and bot messages in the session file
+    history.add_user_message(user_message)
+    history.add_ai_message(bot_response)
+    return jsonify({"response": bot_response})
+
+@app.route('/history', methods=['GET'])
+def session_history():
+    history = get_session_history()
+    # Return as list of dicts: [{role: 'user'/'ai', content: ...}]
+    messages = [
+        {"role": m.type, "content": m.content} for m in history.messages
+    ]
+    return jsonify(messages)
 
 @app.route('/chat', methods=['POST'])
 def chat():
@@ -113,6 +172,20 @@ def chat():
     user_message = data.get('message', '')
     if not user_message:
         return jsonify({"error": "No message provided."}), 400
+    # Print the current chat history and context for debugging
+    print("\n--- DEBUG: Current Chat History ---")
+    print(memory.buffer)
+    print("--- END DEBUG ---\n")
+    # Build the full prompt as it will be sent to the LLM
+    # Use the same template as custom_prompt
+    context = "[context will be filled by chain]"
+    chat_history = memory.buffer
+    question = user_message
+    prompt_text = custom_prompt.format(context=context, chat_history=chat_history, question=question)
+    # Count tokens using tiktoken (make sure tiktoken is installed)
+    enc = tiktoken.encoding_for_model("gpt-4")
+    num_tokens = len(enc.encode(prompt_text))
+    print(f"--- DEBUG: Total tokens sent to LLM: {num_tokens} ---\n")
     result = qa_chain.invoke({"question": user_message})
     return jsonify({
         "answer": result["answer"],
@@ -148,6 +221,19 @@ def chat_stream():
         return answer.lstrip()
 
     def generate():
+        # --- DEBUG LOGGING ---
+        print("\n--- DEBUG: Current Chat History (stream) ---")
+        print(memory.buffer)
+        print("--- END DEBUG ---\n")
+        # Build the full prompt as it will be sent to the LLM
+        context = "[context will be filled by chain]"
+        chat_history = memory.buffer
+        question = user_message
+        prompt_text = custom_prompt.format(context=context, chat_history=chat_history, question=question)
+        enc = tiktoken.encoding_for_model("gpt-4")
+        num_tokens = len(enc.encode(prompt_text))
+        print(f"--- DEBUG: Total tokens sent to LLM (stream): {num_tokens} ---\n")
+        # --- END DEBUG LOGGING ---
         def run_chain():
             qa_chain_stream.invoke({"question": user_message})
             handler.q.put(None)  # Signal end of stream
@@ -170,6 +256,51 @@ def chat_stream():
             else:
                 yield token
         thread.join()
+
+    return Response(stream_with_context(generate()), mimetype='text/plain')
+
+@app.route('/session-chat-stream', methods=['POST'])
+def session_chat_stream():
+    data = request.get_json()
+    user_message = data.get('message', '')
+    if not user_message:
+        return jsonify({"error": "No message provided."}), 400
+
+    history = get_session_history()
+    # Create a ConversationSummaryMemory for this session
+    session_memory = ConversationSummaryMemory(
+        llm=llm,
+        memory_key="chat_history",
+        return_messages=True,
+        output_key="answer",
+        max_token_limit=1250,
+        chat_memory=history
+    )
+    # Streaming LLM
+    handler = QueueStreamHandler()
+    streaming_llm = ChatOpenAI(openai_api_key=openai_api_key, model="gpt-4", streaming=True, callbacks=[handler])
+    session_chain = ConversationalRetrievalChain.from_llm(
+        llm=streaming_llm,
+        retriever=retriever,
+        memory=session_memory,
+        combine_docs_chain_kwargs={"prompt": custom_prompt},
+        return_source_documents=True
+    )
+
+    def generate():
+        bot_message = ""
+        def run_chain():
+            session_chain.invoke({"question": user_message})
+            handler.q.put(None)  # Signal end of stream
+        thread = threading.Thread(target=run_chain)
+        thread.start()
+        for token in handler.get_stream():
+            bot_message += token
+            yield token
+        thread.join()
+        # After streaming, store user and bot messages
+        history.add_user_message(user_message)
+        history.add_ai_message(bot_message)
 
     return Response(stream_with_context(generate()), mimetype='text/plain')
 
