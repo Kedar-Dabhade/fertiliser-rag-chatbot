@@ -60,7 +60,7 @@ def retrieve_top_docs(query: str):
     logger.info(f"[RETRIEVAL] Query: {query}")
     logger.info(f"[RETRIEVAL] Initial {K_CANDIDATES} candidates (doc, score):")
     for i, (doc, score) in enumerate(results_with_scores):
-        logger.info(f"  Candidate {i+1}: Score={score:.4f}, Preview={doc.page_content[:80].replace('\n',' ')}...")
+        logger.info(f"  Candidate {i+1}: Score={score:.4f}, Metadata={doc.metadata}, Preview={doc.page_content[:120].replace('\n',' ')}...")
     docs = []
     for doc, score in results_with_scores:
         doc.metadata = dict(doc.metadata)
@@ -68,11 +68,16 @@ def retrieve_top_docs(query: str):
         docs.append(doc)
     filtered_docs = [doc for doc in docs if doc.metadata["similarity_score"] >= SIMILARITY_THRESHOLD]
     logger.info(f"[RETRIEVAL] {len(filtered_docs)} docs passed similarity threshold ({SIMILARITY_THRESHOLD})")
+    for i, doc in enumerate(filtered_docs):
+        logger.info(f"  Passed {i+1}: Score={doc.metadata['similarity_score']:.4f}, Metadata={doc.metadata}, Preview={doc.page_content[:120].replace('\n',' ')}...")
     filtered_docs.sort(key=lambda d: d.metadata["similarity_score"], reverse=True)
     top_docs = filtered_docs[:MAX_CONTEXT_DOCS]
     logger.info(f"[RETRIEVAL] Top {len(top_docs)} docs selected for LLM context:")
     for i, doc in enumerate(top_docs):
-        logger.info(f"  Top {i+1}: Score={doc.metadata['similarity_score']:.4f}, Preview={doc.page_content[:80].replace('\n',' ')}...")
+        logger.info(f"  Top {i+1}: Score={doc.metadata['similarity_score']:.4f}, Metadata={doc.metadata}, Preview={doc.page_content[:120].replace('\n',' ')}...")
+    # Log the full context that will be sent to the LLM
+    context_preview = '\n---\n'.join([doc.page_content[:200].replace('\n',' ') for doc in top_docs])
+    logger.info(f"[RETRIEVAL] Final context sent to LLM (first 200 chars per doc):\n{context_preview}")
     return top_docs
 
 # Set up LLM
@@ -209,6 +214,9 @@ def chat():
     context_docs = retrieve_top_docs(query)
     # Build context from best docs
     context = "\n\n".join([doc.page_content for doc in context_docs])
+    # Log the context and sources being sent to the LLM
+    logger.info(f"[CHAT] Context sent to LLM (first 300 chars): {context[:300].replace('\n',' ')}")
+    logger.info(f"[CHAT] Source metadata: {[doc.metadata for doc in context_docs]}")
     # Print the current chat history and context for debugging
     print("\n--- DEBUG: Current Chat History ---")
     print(memory.buffer)
@@ -261,13 +269,16 @@ def chat_stream():
         print(memory.buffer)
         print("--- END DEBUG ---\n")
         # Build the full prompt as it will be sent to the LLM
-        context = "[context will be filled by chain]"
+        context_docs = retrieve_top_docs(user_message)
+        context = "\n\n".join([doc.page_content for doc in context_docs])
+        logger.info(f"[CHAT-STREAM] Context sent to LLM (first 300 chars): {context[:300].replace('\n',' ')}")
+        logger.info(f"[CHAT-STREAM] Source metadata: {[doc.metadata for doc in context_docs]}")
         chat_history = memory.buffer
         question = user_message
         prompt_text = custom_prompt.format(context=context, chat_history=chat_history, question=question)
         enc = tiktoken.encoding_for_model("gpt-4")
         num_tokens = len(enc.encode(prompt_text))
-        print(f"--- DEBUG: Total tokens sent to LLM (stream): {num_tokens} ---\n")
+        logger.info(f"[TOKENS] Total tokens sent to LLM (stream): {num_tokens}")
         # --- END DEBUG LOGGING ---
         def run_chain():
             qa_chain_stream.invoke({"question": user_message})
